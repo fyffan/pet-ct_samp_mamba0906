@@ -1,0 +1,6 @@
+# ninja log v5
+1	14019	1757415376397419048	/data1/users/fangyifan/Works/work_cipa_0907/CIPA/models/encoders/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/selective_scan_core_fwd2.o	236a275eb91fdf38
+2	18131	1757415380501407894	/data1/users/fangyifan/Works/work_cipa_0907/CIPA/models/encoders/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/selective_scan_core_fwd3.o	c4ab74d97b4da014
+0	19056	1757415381449405318	/data1/users/fangyifan/Works/work_cipa_0907/CIPA/models/encoders/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/selective_scan.o	f217964c0c89d73f
+2	22574	1757415384933395857	/data1/users/fangyifan/Works/work_cipa_0907/CIPA/models/encoders/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/selective_scan_core_fwd4.o	f6569672d66d139c
+1	31625	1757415393997371265	/data1/users/fangyifan/Works/work_cipa_0907/CIPA/models/encoders/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/selective_scan_core.o	e88e4a34e47fde5a
