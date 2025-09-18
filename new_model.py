@@ -15,8 +15,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, List, Tuple
+import numpy as np
+from typing import Optional, List, Tuple, Union
 from models.encoders.vmamba import Backbone_VSSM
+
+# SAM imports
+try:
+    from segment_anything import sam_model_registry, SamPredictor
+    from segment_anything.utils.transforms import ResizeLongestSide
+    SAM_AVAILABLE = True
+    print("Standard SAM is available")
+except ImportError:
+    SAM_AVAILABLE = False
+    print("Standard SAM not available. Install with: pip install git+https://github.com/facebookresearch/segment-anything.git")
+
+# MedSAM imports
+try:
+    import sys
+    import os
+    # Try to import MedSAM directly if installed
+    try:
+        # If MedSAM is cloned locally, add to path
+        medsam_path = './MedSAM'
+        if os.path.exists(medsam_path) and medsam_path not in sys.path:
+            sys.path.insert(0, medsam_path)
+
+        # Import MedSAM specific registry
+        from segment_anything import sam_model_registry as medsam_model_registry
+        MEDSAM_AVAILABLE = True
+        print("MedSAM is available")
+    except ImportError:
+        # Fallback to standard SAM registry for MedSAM models
+        from segment_anything import sam_model_registry as medsam_model_registry
+        MEDSAM_AVAILABLE = True
+        print("Using standard SAM registry for MedSAM models")
+except ImportError:
+    MEDSAM_AVAILABLE = False
+    print("MedSAM not available. Please install segment-anything and download MedSAM checkpoint")
 
 
 class LearnableQueries(nn.Module):
@@ -253,6 +288,188 @@ class PointExtractor(nn.Module):
         return points
 
 
+class RealSAMWrapper(nn.Module):
+    """
+    Wrapper for real SAM models (both standard SAM and MedSAM)
+    Provides a unified interface for both models
+    """
+    def __init__(
+        self,
+        model_type: str = "vit_b",  # vit_b, vit_l, vit_h
+        sam_variant: str = "sam",   # "sam" or "medsam"
+        checkpoint_path: Optional[str] = None,
+        device: str = "cuda"
+    ):
+        super().__init__()
+        self.model_type = model_type
+        self.sam_variant = sam_variant
+        self.device = device
+        self.sam_model = None
+        self.predictor = None
+
+        # Initialize the appropriate SAM model
+        self._load_sam_model(checkpoint_path)
+
+    def _load_sam_model(self, checkpoint_path: Optional[str]):
+        """Load the specified SAM model"""
+        if self.sam_variant == "sam" and SAM_AVAILABLE:
+            if checkpoint_path is None:
+                raise ValueError("checkpoint_path is required for standard SAM")
+
+            # Load standard SAM
+            self.sam_model = sam_model_registry[self.model_type](checkpoint=checkpoint_path)
+            self.sam_model.to(self.device)
+            self.predictor = SamPredictor(self.sam_model)
+            print(f"Loaded standard SAM {self.model_type} from {checkpoint_path}")
+
+        elif self.sam_variant == "medsam" and MEDSAM_AVAILABLE:
+            if checkpoint_path is None:
+                raise ValueError("checkpoint_path is required for MedSAM")
+
+            # Load MedSAM
+            self.sam_model = medsam_model_registry[self.model_type](checkpoint=checkpoint_path)
+            self.sam_model.to(self.device)
+            self.predictor = SamPredictor(self.sam_model)
+            print(f"Loaded MedSAM {self.model_type} from {checkpoint_path}")
+
+        else:
+            raise ValueError(f"SAM variant '{self.sam_variant}' not available or not supported")
+
+    def predict_masks_from_boxes(self, image: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+        """
+        Generate masks from bounding box prompts
+        Args:
+            image: Input image [B, C, H, W] - assuming RGB format
+            boxes: Bounding boxes [B, 4] in format (x1, y1, x2, y2)
+        Returns:
+            masks: Generated masks [B, 1, H, W]
+        """
+        if self.sam_model is None:
+            raise RuntimeError("SAM model not loaded")
+
+        batch_size = image.shape[0]
+        masks = []
+
+        # Convert to numpy for SAM processing
+        image_np = image.detach().cpu().numpy()
+        boxes_np = boxes.detach().cpu().numpy()
+
+        for b in range(batch_size):
+            # Get single image - convert from [C, H, W] to [H, W, C]
+            if image_np[b].shape[0] == 1:  # Grayscale
+                img = np.repeat(image_np[b].transpose(1, 2, 0), 3, axis=2)  # Convert to RGB
+            else:
+                img = image_np[b].transpose(1, 2, 0)
+
+            # Normalize to 0-255 range if needed
+            if img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+            else:
+                img = img.astype(np.uint8)
+
+            # Set image for predictor
+            self.predictor.set_image(img)
+
+            # Convert box format and predict
+            box = boxes_np[b]  # [x1, y1, x2, y2]
+
+            # SAM expects box in xyxy format which matches our input
+            mask, scores, logits = self.predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=box[None, :],  # Add batch dimension
+                multimask_output=False
+            )
+
+            # Convert back to tensor and add to list
+            mask_tensor = torch.from_numpy(mask[0]).float().unsqueeze(0)  # [1, H, W]
+            masks.append(mask_tensor)
+
+        # Stack all masks
+        masks = torch.stack(masks, dim=0)  # [B, 1, H, W]
+        return masks.to(self.device)
+
+    def predict_masks_from_points(self, image: torch.Tensor, points: List[List]) -> torch.Tensor:
+        """
+        Generate masks from point prompts
+        Args:
+            image: Input image [B, C, H, W]
+            points: List of point coordinates for each batch item
+        Returns:
+            masks: Generated masks [B, 1, H, W]
+        """
+        if self.sam_model is None:
+            raise RuntimeError("SAM model not loaded")
+
+        batch_size = image.shape[0]
+        masks = []
+
+        # Convert to numpy for SAM processing
+        image_np = image.detach().cpu().numpy()
+
+        for b in range(batch_size):
+            # Get single image
+            if image_np[b].shape[0] == 1:  # Grayscale
+                img = np.repeat(image_np[b].transpose(1, 2, 0), 3, axis=2)
+            else:
+                img = image_np[b].transpose(1, 2, 0)
+
+            # Normalize to 0-255 range if needed
+            if img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+            else:
+                img = img.astype(np.uint8)
+
+            # Set image for predictor
+            self.predictor.set_image(img)
+
+            # Get points for this batch item
+            batch_points = points[b] if b < len(points) else []
+
+            if len(batch_points) > 0:
+                point_coords = np.array(batch_points)
+                point_labels = np.ones(len(batch_points))  # All positive points
+
+                mask, scores, logits = self.predictor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    box=None,
+                    multimask_output=False
+                )
+
+                mask_tensor = torch.from_numpy(mask[0]).float().unsqueeze(0)
+            else:
+                # No points provided, return empty mask
+                H, W = img.shape[:2]
+                mask_tensor = torch.zeros(1, H, W)
+
+            masks.append(mask_tensor)
+
+        masks = torch.stack(masks, dim=0)
+        return masks.to(self.device)
+
+    def forward(self, image: torch.Tensor, boxes: Optional[torch.Tensor] = None,
+                points: Optional[List[List]] = None) -> dict:
+        """
+        Forward pass for SAM model
+        Args:
+            image: Input image [B, C, H, W]
+            boxes: Bounding boxes [B, 4] (optional)
+            points: Point coordinates (optional)
+        Returns:
+            Dictionary with generated masks
+        """
+        results = {}
+
+        if boxes is not None:
+            results['box_masks'] = self.predict_masks_from_boxes(image, boxes)
+
+        if points is not None:
+            results['point_masks'] = self.predict_masks_from_points(image, points)
+
+        return results
+
+
 class SAMPromptEncoder(nn.Module):
     """
     Simplified SAM prompt encoder for processing box and point prompts
@@ -421,9 +638,16 @@ class NewWeaklySupervised_PETCT_Model(nn.Module):
         transformer_dim: int = 256,
         num_queries: int = 100,
         num_classes: int = 2,
-        sam_feature_dim: int = 256
+        sam_feature_dim: int = 256,
+        use_real_sam: bool = True,
+        sam_variant: str = "sam",  # "sam" or "medsam"
+        sam_model_type: str = "vit_b",  # "vit_b", "vit_l", "vit_h"
+        sam_checkpoint_path: Optional[str] = None
     ):
         super().__init__()
+
+        self.use_real_sam = use_real_sam
+        self.sam_variant = sam_variant
 
         # PET and CT Encoders (shared weights)
         self.pet_encoder = Backbone_VSSM(
@@ -464,9 +688,23 @@ class NewWeaklySupervised_PETCT_Model(nn.Module):
         # Point extractor
         self.point_extractor = PointExtractor(top_k=5)
 
-        # SAM components
-        self.sam_prompt_encoder = SAMPromptEncoder(embed_dim=transformer_dim)
-        self.sam_mask_decoder = SAMMaskDecoder(feature_dim=transformer_dim, embed_dim=transformer_dim)
+        # SAM components - choose between real SAM and simplified SAM
+        if self.use_real_sam and (SAM_AVAILABLE or MEDSAM_AVAILABLE):
+            print(f"Using real {sam_variant.upper()} model: {sam_model_type}")
+            self.sam_model = RealSAMWrapper(
+                model_type=sam_model_type,
+                sam_variant=sam_variant,
+                checkpoint_path=sam_checkpoint_path,
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            )
+            # Keep these for compatibility but they won't be used with real SAM
+            self.sam_prompt_encoder = None
+            self.sam_mask_decoder = None
+        else:
+            print("Using simplified SAM implementation")
+            self.sam_model = None
+            self.sam_prompt_encoder = SAMPromptEncoder(embed_dim=transformer_dim)
+            self.sam_mask_decoder = SAMMaskDecoder(feature_dim=transformer_dim, embed_dim=transformer_dim)
 
         # Final decoder (using existing implementation)
         try:
@@ -547,20 +785,59 @@ class NewWeaklySupervised_PETCT_Model(nn.Module):
         sam_masks = {}
 
         if boxes is not None:
-            # Box prompt masks
-            box_prompts = self.sam_prompt_encoder(boxes=boxes)
-            box_masks_pet = self.sam_mask_decoder(pet_features_proj[-1], box_prompts)
-            box_masks_ct = self.sam_mask_decoder(ct_features_proj[-1], box_prompts)
-            sam_masks['box_pet'] = box_masks_pet
-            sam_masks['box_ct'] = box_masks_ct
+            if self.use_real_sam and self.sam_model is not None:
+                # Use real SAM model
+                # For real SAM, we need to provide the full CT image for better segmentation
+                # Convert single channel to RGB for SAM
+                ct_rgb = ct_img.repeat(1, 3, 1, 1)  # [B, 3, H, W]
 
-            # Point prompt masks
-            point_prompts_pet = self.sam_prompt_encoder(points=pet_points)
-            point_prompts_ct = self.sam_prompt_encoder(points=ct_points)
-            point_masks_pet = self.sam_mask_decoder(pet_features_proj[-1], point_prompts_pet)
-            point_masks_ct = self.sam_mask_decoder(ct_features_proj[-1], point_prompts_ct)
-            sam_masks['point_pet'] = point_masks_pet
-            sam_masks['point_ct'] = point_masks_ct
+                sam_results = self.sam_model(ct_rgb, boxes=boxes, points=ct_points)
+
+                if 'box_masks' in sam_results:
+                    # Resize to match feature map size if needed
+                    box_masks = sam_results['box_masks']
+                    target_size = ct_features_proj[-1].shape[2:]
+                    if box_masks.shape[2:] != target_size:
+                        box_masks = F.interpolate(box_masks, size=target_size, mode='bilinear', align_corners=False)
+                    sam_masks['box_ct'] = box_masks
+
+                if 'point_masks' in sam_results:
+                    point_masks = sam_results['point_masks']
+                    if point_masks.shape[2:] != target_size:
+                        point_masks = F.interpolate(point_masks, size=target_size, mode='bilinear', align_corners=False)
+                    sam_masks['point_ct'] = point_masks
+
+                # Also process PET if needed (though CT is primary for segmentation)
+                pet_rgb = pet_img.repeat(1, 3, 1, 1)
+                sam_results_pet = self.sam_model(pet_rgb, boxes=boxes, points=pet_points)
+
+                if 'box_masks' in sam_results_pet:
+                    box_masks_pet = sam_results_pet['box_masks']
+                    if box_masks_pet.shape[2:] != target_size:
+                        box_masks_pet = F.interpolate(box_masks_pet, size=target_size, mode='bilinear', align_corners=False)
+                    sam_masks['box_pet'] = box_masks_pet
+
+                if 'point_masks' in sam_results_pet:
+                    point_masks_pet = sam_results_pet['point_masks']
+                    if point_masks_pet.shape[2:] != target_size:
+                        point_masks_pet = F.interpolate(point_masks_pet, size=target_size, mode='bilinear', align_corners=False)
+                    sam_masks['point_pet'] = point_masks_pet
+
+            else:
+                # Use simplified SAM implementation (original code)
+                box_prompts = self.sam_prompt_encoder(boxes=boxes)
+                box_masks_pet = self.sam_mask_decoder(pet_features_proj[-1], box_prompts)
+                box_masks_ct = self.sam_mask_decoder(ct_features_proj[-1], box_prompts)
+                sam_masks['box_pet'] = box_masks_pet
+                sam_masks['box_ct'] = box_masks_ct
+
+                # Point prompt masks
+                point_prompts_pet = self.sam_prompt_encoder(points=pet_points)
+                point_prompts_ct = self.sam_prompt_encoder(points=ct_points)
+                point_masks_pet = self.sam_mask_decoder(pet_features_proj[-1], point_prompts_pet)
+                point_masks_ct = self.sam_mask_decoder(ct_features_proj[-1], point_prompts_ct)
+                sam_masks['point_pet'] = point_masks_pet
+                sam_masks['point_ct'] = point_masks_ct
 
         # 7. Final segmentation - add PET features to CT features
         fused_features = []
@@ -626,7 +903,11 @@ def build_model(config: dict = None):
             'transformer_dim': 256,
             'num_queries': 100,
             'num_classes': 2,
-            'sam_feature_dim': 256
+            'sam_feature_dim': 256,
+            'use_real_sam': True,
+            'sam_variant': 'sam',  # 'sam' or 'medsam'
+            'sam_model_type': 'vit_b',  # 'vit_b', 'vit_l', 'vit_h'
+            'sam_checkpoint_path': None  # Will need to be set before training
         }
 
     model = NewWeaklySupervised_PETCT_Model(**config)
@@ -888,6 +1169,16 @@ def main():
     parser.add_argument('--eval_freq', type=int, default=5, help='Evaluation frequency')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
+    # SAM related arguments
+    parser.add_argument('--sam_type', type=str, default='standard_sam_vit_b',
+                       choices=['standard_sam_vit_b', 'standard_sam_vit_l', 'standard_sam_vit_h',
+                               'medsam', 'simplified_sam'],
+                       help='Type of SAM model to use')
+    parser.add_argument('--sam_checkpoint', type=str, default='',
+                       help='Path to SAM checkpoint (if not specified, uses default path)')
+    parser.add_argument('--use_real_sam', action='store_true', default=True,
+                       help='Use real SAM model (default: True)')
+
     args = parser.parse_args()
 
     # Set random seed
@@ -930,8 +1221,31 @@ def main():
         pin_memory=True
     )
 
-    # Create model
-    model = build_model()
+    # Create model with specified SAM type
+    print(f"Building model with SAM type: {args.sam_type}")
+
+    # Determine SAM checkpoint path
+    sam_checkpoint_path = args.sam_checkpoint
+    if not sam_checkpoint_path:
+        # Use default paths
+        default_paths = {
+            'standard_sam_vit_b': './checkpoints/sam_vit_b_01ec64.pth',
+            'standard_sam_vit_l': './checkpoints/sam_vit_l_0b3195.pth',
+            'standard_sam_vit_h': './checkpoints/sam_vit_h_4b8939.pth',
+            'medsam': './checkpoints/medsam_vit_b.pth',
+            'simplified_sam': None
+        }
+        sam_checkpoint_path = default_paths.get(args.sam_type)
+
+    # Check if checkpoint exists for real SAM models
+    if args.sam_type != 'simplified_sam' and args.use_real_sam:
+        if sam_checkpoint_path and not os.path.exists(sam_checkpoint_path):
+            print(f"Warning: SAM checkpoint not found at {sam_checkpoint_path}")
+            print("Please download the appropriate SAM model first.")
+            print("Falling back to simplified SAM implementation.")
+            args.use_real_sam = False
+
+    model = build_model_with_sam(args.sam_type, sam_checkpoint_path)
     model.to(device)
 
     # Print model parameters
@@ -1041,3 +1355,142 @@ if __name__ == "__main__":
 
         print("\nTo start training, run:")
         print("python new_model.py train --data_root /path/to/your/data --batch_size 4 --epochs 50")
+
+
+# ==================== SAM Model Usage Examples ====================
+
+def get_sam_model_examples():
+    """
+    Examples of how to use different SAM models
+    """
+    examples = {
+        'standard_sam_vit_b': {
+            'config': {
+                'encoder_dims': [96, 192, 384, 768],
+                'transformer_dim': 256,
+                'num_queries': 100,
+                'num_classes': 2,
+                'use_real_sam': True,
+                'sam_variant': 'sam',
+                'sam_model_type': 'vit_b',
+                'sam_checkpoint_path': './checkpoints/sam_vit_b_01ec64.pth'
+            },
+            'description': 'Standard SAM with ViT-B backbone'
+        },
+
+        'standard_sam_vit_l': {
+            'config': {
+                'encoder_dims': [96, 192, 384, 768],
+                'transformer_dim': 256,
+                'num_queries': 100,
+                'num_classes': 2,
+                'use_real_sam': True,
+                'sam_variant': 'sam',
+                'sam_model_type': 'vit_l',
+                'sam_checkpoint_path': './checkpoints/sam_vit_l_0b3195.pth'
+            },
+            'description': 'Standard SAM with ViT-L backbone (larger, more accurate)'
+        },
+
+        'standard_sam_vit_h': {
+            'config': {
+                'encoder_dims': [96, 192, 384, 768],
+                'transformer_dim': 256,
+                'num_queries': 100,
+                'num_classes': 2,
+                'use_real_sam': True,
+                'sam_variant': 'sam',
+                'sam_model_type': 'vit_h',
+                'sam_checkpoint_path': './checkpoints/sam_vit_h_4b8939.pth'
+            },
+            'description': 'Standard SAM with ViT-H backbone (largest, most accurate)'
+        },
+
+        'medsam': {
+            'config': {
+                'encoder_dims': [96, 192, 384, 768],
+                'transformer_dim': 256,
+                'num_queries': 100,
+                'num_classes': 2,
+                'use_real_sam': True,
+                'sam_variant': 'medsam',
+                'sam_model_type': 'vit_b',
+                'sam_checkpoint_path': './checkpoints/medsam_vit_b.pth'
+            },
+            'description': 'MedSAM model specifically trained for medical images'
+        },
+
+        'simplified_sam': {
+            'config': {
+                'encoder_dims': [96, 192, 384, 768],
+                'transformer_dim': 256,
+                'num_queries': 100,
+                'num_classes': 2,
+                'use_real_sam': False
+            },
+            'description': 'Simplified SAM implementation (no external dependencies)'
+        }
+    }
+
+    return examples
+
+
+def build_model_with_sam(sam_type: str = 'standard_sam_vit_b', checkpoint_path: Optional[str] = None):
+    """
+    Build model with specific SAM configuration
+
+    Args:
+        sam_type: Type of SAM model ('standard_sam_vit_b', 'standard_sam_vit_l',
+                  'standard_sam_vit_h', 'medsam', 'simplified_sam')
+        checkpoint_path: Path to SAM checkpoint (overrides default path)
+
+    Returns:
+        model: Configured model with SAM
+    """
+    examples = get_sam_model_examples()
+
+    if sam_type not in examples:
+        available_types = list(examples.keys())
+        raise ValueError(f"sam_type must be one of {available_types}")
+
+    config = examples[sam_type]['config'].copy()
+
+    if checkpoint_path is not None:
+        config['sam_checkpoint_path'] = checkpoint_path
+
+    print(f"Building model with {sam_type}: {examples[sam_type]['description']}")
+    model = NewWeaklySupervised_PETCT_Model(**config)
+
+    return model
+
+
+# Example usage:
+if __name__ == "__main__" and len(sys.argv) == 1:
+    print("=" * 80)
+    print("SAM Integration Examples")
+    print("=" * 80)
+
+    examples = get_sam_model_examples()
+    for name, info in examples.items():
+        print(f"\n{name.upper()}:")
+        print(f"Description: {info['description']}")
+        print("Config:", info['config'])
+
+    print("\n" + "=" * 80)
+    print("To build a model with specific SAM:")
+    print("model = build_model_with_sam('standard_sam_vit_b', '/path/to/checkpoint')")
+    print("=" * 80)
+
+    print("\n" + "=" * 80)
+    print("MedSAM Usage Instructions:")
+    print("=" * 80)
+    print("1. Install dependencies:")
+    print("   pip install git+https://github.com/facebookresearch/segment-anything.git")
+    print("\n2. Download MedSAM checkpoint:")
+    print("   Visit: https://drive.google.com/drive/folders/1ETWmi4AiniJeWOt6HAsYgTjYv_fkgzoN?usp=sharing")
+    print("   Download 'medsam_vit_b.pth' to './checkpoints/'")
+    print("\n3. Use MedSAM in your code:")
+    print("   model = build_model_with_sam('medsam', './checkpoints/medsam_vit_b.pth')")
+    print("\n4. Train with MedSAM:")
+    print("   python new_model.py train --data_root /path/to/data --sam_type medsam")
+    print("=" * 80)
